@@ -5,13 +5,14 @@ import re
 import urllib.parse
 from pathlib import Path
 
-from .converter import ConversionResult, blocks_to_markdown, extract_rich_text
+from .converter import MeetingSection, blocks_to_markdown, extract_rich_text
 
 # Default earliest date to sync from (used when no checkpoint exists)
 DEFAULT_SINCE = "2026-03-25T00:00:00.000Z"
 
 SYNC_STATE_REL = ".notion-sync/last_sync.json"
 RECORDINGS_DIR = "recordings"
+MEETING_NOTES_DIR = "Meeting Notes"
 
 # Folders excluded from vault scanning and writes (like .gitignore entries)
 EXCLUDED_DIRS: frozenset[str] = frozenset({"Notion backup"})
@@ -45,7 +46,7 @@ def write_last_sync(vault_path: Path, timestamp: str, dry_run: bool):
 
 
 # ---------------------------------------------------------------------------
-# Filename helpers
+# Filename / title helpers
 # ---------------------------------------------------------------------------
 
 def sanitize_title(title: str) -> str:
@@ -54,7 +55,7 @@ def sanitize_title(title: str) -> str:
 
 
 def make_filename(title: str, created_time: str) -> str:
-    """Return the vault filename for a page.
+    """Return the vault filename for a regular page.
 
     Prefixes with YYYY-MM-DD (from created_time) unless the title already
     contains a date pattern.
@@ -65,10 +66,6 @@ def make_filename(title: str, created_time: str) -> str:
     return f"{created_time[:10]} {sanitized}.md"
 
 
-# ---------------------------------------------------------------------------
-# Page → Markdown document
-# ---------------------------------------------------------------------------
-
 def extract_page_title(page: dict) -> str:
     for prop in page.get("properties", {}).values():
         if prop.get("type") == "title":
@@ -78,15 +75,12 @@ def extract_page_title(page: dict) -> str:
     return "Untitled"
 
 
-def build_page_document(page: dict, blocks: list) -> tuple[str, str]:
-    """Convert a Notion page and its blocks into a (filename, markdown) pair.
+# ---------------------------------------------------------------------------
+# Regular page → Markdown document
+# ---------------------------------------------------------------------------
 
-    The markdown document contains:
-      - YAML frontmatter (notion-id, title, created, updated)
-      - Body converted from blocks
-      - Optional ## Transcript section
-      - Optional ## Recording section with Obsidian wikilinks
-    """
+def build_page_document(page: dict, blocks: list) -> tuple[str, str]:
+    """Convert a Notion page and its blocks into a (filename, markdown) pair."""
     page_id = page["id"]
     title = extract_page_title(page)
     created = page.get("created_time", "")
@@ -105,13 +99,8 @@ def build_page_document(page: dict, blocks: list) -> tuple[str, str]:
         *conversion.md_lines,
     ]
 
-    if conversion.transcript_lines:
-        parts += ["", "## Transcript", "", *conversion.transcript_lines]
-
     if conversion.audio_urls:
-        parts.append("")
-        parts.append("## Recording")
-        parts.append("")
+        parts += ["", "## Recording", ""]
         for url in conversion.audio_urls:
             fname = Path(urllib.parse.urlparse(url).path).name or "recording"
             parts.append(f"[[{RECORDINGS_DIR}/{fname}]]")
@@ -121,6 +110,102 @@ def build_page_document(page: dict, blocks: list) -> tuple[str, str]:
         content += "\n"
 
     return make_filename(title, created), content
+
+
+# ---------------------------------------------------------------------------
+# Meeting notes → three-file folder structure
+# ---------------------------------------------------------------------------
+
+def build_meeting_documents(
+    page: dict,
+    section: MeetingSection,
+) -> dict[str, str]:
+    """Return {"Summary.md": content, "Notes.md": content, "Transcribing.md": content}.
+
+    Each file carries YAML frontmatter and Obsidian wikilinks to the other two.
+    notion-id is stored only in Summary.md (used for vault index / overwrite detection).
+    """
+    page_id = page["id"]
+    title = extract_page_title(page)
+    created = page.get("created_time", "")
+    updated = page.get("last_edited_time", "")
+
+    nav_for = {
+        "Summary.md":     "*[[Notes]] | [[Transcribing]]*",
+        "Notes.md":       "*[[Summary]] | [[Transcribing]]*",
+        "Transcribing.md": "*[[Summary]] | [[Notes]]*",
+    }
+
+    def _doc(filename: str, extra_frontmatter: list[str], body_lines: list[str]) -> str:
+        fm = ["---"] + extra_frontmatter + ["---", ""]
+        nav = [nav_for[filename], ""]
+        parts = fm + nav + body_lines
+        content = "\n".join(parts)
+        return content if content.endswith("\n") else content + "\n"
+
+    recording_line = []
+    if section.recording_start:
+        end = f" → {section.recording_end}" if section.recording_end else ""
+        recording_line = [f"*Recording: {section.recording_start}{end}*", ""]
+
+    summary = _doc(
+        "Summary.md",
+        [
+            f"notion-id: {page_id}",
+            f"title: {title}",
+            f"created: {created}",
+            f"updated: {updated}",
+        ],
+        recording_line + section.summary_lines,
+    )
+
+    notes = _doc(
+        "Notes.md",
+        [f"title: {title} — Notes"],
+        section.notes_lines or [""],
+    )
+
+    transcript = _doc(
+        "Transcribing.md",
+        [f"title: {title} — Transcript"],
+        section.transcript_lines or [""],
+    )
+
+    return {
+        "Summary.md": summary,
+        "Notes.md": notes,
+        "Transcribing.md": transcript,
+    }
+
+
+def write_meeting_files(
+    vault_path: Path,
+    page: dict,
+    section: MeetingSection,
+    existing_summary_path: Path | None,
+    dry_run: bool,
+) -> Path:
+    """Write the three meeting note files, returning the path to Summary.md."""
+    if (existing_summary_path
+            and not _is_excluded(existing_summary_path)
+            and existing_summary_path.name == "Summary.md"):
+        folder = existing_summary_path.parent
+    else:
+        folder_name = sanitize_title(extract_page_title(page))
+        folder = vault_path / MEETING_NOTES_DIR / folder_name
+
+    documents = build_meeting_documents(page, section)
+
+    for filename, content in documents.items():
+        target = folder / filename
+        if dry_run:
+            action = "overwrite" if existing_summary_path else "create"
+            print(f"[dry-run] Would {action}: {target}")
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+
+    return folder / "Summary.md"
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +246,7 @@ def build_vault_index(vault_path: Path) -> dict[str, Path]:
 
 
 # ---------------------------------------------------------------------------
-# Vault writer
+# Regular page writer
 # ---------------------------------------------------------------------------
 
 def write_page(

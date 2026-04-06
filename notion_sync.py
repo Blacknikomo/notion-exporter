@@ -21,16 +21,18 @@ import requests
 
 from notion.api import NotionClient
 from notion.config import load_config
+from notion.converter import blocks_to_markdown
 from notion.vault import (
     DEFAULT_SINCE,
+    MEETING_NOTES_DIR,
     RECORDINGS_DIR,
     build_page_document,
     build_vault_index,
     read_last_sync,
     write_last_sync,
+    write_meeting_files,
     write_page,
 )
-from notion.converter import blocks_to_markdown
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,13 +42,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def print_summary(synced: int, ai_notes_count: int, errors: list, dry_run: bool):
+def print_summary(synced: int, meeting_count: int, errors: list, dry_run: bool):
     print()
     print("Notion Sync Summary")
     print("-------------------")
     print(f"Mode: {'DRY RUN' if dry_run else 'LIVE'}")
     print(f"Pages synced: {synced}")
-    print(f"Pages with AI Notes / audio: {ai_notes_count}")
+    print(f"Meeting notes (3-file folders): {meeting_count}")
     print(f"Errors: {len(errors)}")
     for err in errors:
         print(f"  - {err}")
@@ -77,7 +79,7 @@ def main():
     print(f"Found {len(pages)} page(s) to sync.")
 
     synced = 0
-    ai_notes_count = 0
+    meeting_count = 0
     errors = []
 
     for page in pages:
@@ -88,10 +90,19 @@ def main():
         try:
             blocks = client.get_blocks(page_id)
             conversion = blocks_to_markdown(blocks)
-            filename, content = build_page_document(page, blocks)
-
             existing = vault_index.get(page_id)
-            written = write_page(vault_path, filename, content, existing, args.dry_run)
+
+            if conversion.meeting_sections:
+                # Pages with AI Notes → Meeting Notes/{folder}/Summary|Notes|Transcribing.md
+                section = conversion.meeting_sections[0]
+                written = write_meeting_files(vault_path, page, section, existing, args.dry_run)
+                print(f"    → {MEETING_NOTES_DIR}/{written.parent.name}/")
+                meeting_count += 1
+            else:
+                # Regular page → single .md file
+                filename, content = build_page_document(page, blocks)
+                written = write_page(vault_path, filename, content, existing, args.dry_run)
+
             vault_index[page_id] = written
 
             for url in conversion.audio_urls:
@@ -103,8 +114,6 @@ def main():
                     client.download_file(url, dest)
 
             synced += 1
-            if conversion.transcript_lines or conversion.audio_urls:
-                ai_notes_count += 1
 
         except Exception as exc:  # noqa: BLE001
             msg = f"Page {page_id} ({title!r}): {exc}"
@@ -112,7 +121,7 @@ def main():
             errors.append(msg)
 
     write_last_sync(vault_path, run_start, args.dry_run)
-    print_summary(synced, ai_notes_count, errors, args.dry_run)
+    print_summary(synced, meeting_count, errors, args.dry_run)
 
 
 def _page_title(page: dict) -> str:
